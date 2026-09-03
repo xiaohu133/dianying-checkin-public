@@ -128,8 +128,9 @@ def send_tg_notification(title: str, text_content: str):
     token = cfg.get("tg_bot_token", "").strip()
     chat_id = cfg.get("tg_chat_id", "").strip()
     base_url = cfg.get("tg_base_url", "https://api.telegram.org").strip().rstrip("/")
+    proxy = cfg.get("proxy", "").strip() or os.getenv("HTTP_PROXY", "").strip() or os.getenv("HTTPS_PROXY", "").strip()
     if not token or not chat_id:
-        return
+        return "未配置 Telegram Bot Token 或 Chat ID"
 
     html = f"{title}\n\n{text_content}"
     payload = json.dumps({
@@ -145,10 +146,22 @@ def send_tg_notification(title: str, text_content: str):
         headers={"Content-Type": "application/json"}
     )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            pass
+        if proxy:
+            proxy_handler = urllib.request.ProxyHandler({
+                "http": proxy,
+                "https": proxy
+            })
+            opener = urllib.request.build_opener(proxy_handler)
+            with opener.open(req, timeout=15) as resp:
+                pass
+        else:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                pass
+        logger.info("Telegram 通知发送成功！")
+        return None
     except Exception as e:
         logger.warning("Failed to send Telegram message: %s", e)
+        return str(e)
 
 def execute_account_checkin(acc: dict, is_manual: bool = False) -> dict:
     acc_id = acc.get("id")
@@ -487,10 +500,12 @@ def api_save_global_config(data: dict):
 
 @app.post("/api/test-tg")
 def api_test_tg():
-    send_tg_notification(
+    err = send_tg_notification(
         "🎬 <b>癫影 Telegram 连通性测试</b> ✅",
         f"<b>状态:</b> 连通成功！\n<b>测试时间:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
+    if err:
+        return {"ok": False, "msg": f"发送失败: {err}"}
     return {"ok": True, "msg": "测试消息已发出，请在 Telegram 查看"}
 
 HTML_PAGE = """<!DOCTYPE html>
