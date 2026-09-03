@@ -92,37 +92,44 @@ class Dian115Client:
         if not refresh and self._proof and self._proof[1] > now + 15:
             return self._proof[0]
 
-        headers = self._headers(current_path)
-        r = self._session.get(f"{self.BASE_URL}/api/portal/auth/browser-challenge", headers=headers, timeout=10)
-        data = r.json()
-        proof = str(data.get("proof") or "")
-        ttl = max(30, int(data.get("ttl") or 600))
-        self._proof = (proof, now + ttl)
-        self._current_proof = proof
-        return proof
+        try:
+            headers = self._headers(current_path)
+            r = self._session.get(f"{self.BASE_URL}/api/portal/auth/browser-challenge", headers=headers, timeout=15)
+            data = r.json()
+            proof = str(data.get("proof") or "")
+            ttl = max(30, int(data.get("ttl") or 600))
+            self._proof = (proof, now + ttl)
+            self._current_proof = proof
+            return proof
+        except Exception as e:
+            logger.error("获取 browser-challenge proof 异常: %s", e)
+            return self._current_proof or ""
 
     def _ensure_browser_session(self, current_path: str = "/", refresh: bool = False):
         now = time.time()
         if not refresh and self._browser_session_expires_at > now + 15:
             return
 
-        proof = self._get_proof(current_path, refresh=refresh)
-        headers = self._headers(current_path)
-        headers["content-type"] = "application/json"
-        headers["x-portal-browser-proof"] = proof
+        try:
+            proof = self._get_proof(current_path, refresh=refresh)
+            headers = self._headers(current_path)
+            headers["content-type"] = "application/json"
+            headers["x-portal-browser-proof"] = proof
 
-        r = self._session.post(
-            f"{self.BASE_URL}/api/portal/auth/browser-session",
-            headers=headers,
-            json={"public_jwk": self._public_jwk()},
-            timeout=10
-        )
-        data = r.json()
-        server_time_ms = data.get("server_time_ms")
-        if server_time_ms:
-            self._server_time_offset_ms = int(server_time_ms) - round(now * 1000)
-        ttl = max(60, int(data.get("ttl") or 1800))
-        self._browser_session_expires_at = now + ttl
+            r = self._session.post(
+                f"{self.BASE_URL}/api/portal/auth/browser-session",
+                headers=headers,
+                json={"public_jwk": self._public_jwk()},
+                timeout=15
+            )
+            data = r.json()
+            server_time_ms = data.get("server_time_ms")
+            if server_time_ms:
+                self._server_time_offset_ms = int(server_time_ms) - round(now * 1000)
+            ttl = max(60, int(data.get("ttl") or 1800))
+            self._browser_session_expires_at = now + ttl
+        except Exception as e:
+            logger.error("注册 browser-session 异常: %s", e)
 
     def _browser_signature(self, method: str, api_path: str) -> dict:
         ts = str(round(time.time() * 1000 + self._server_time_offset_ms))
@@ -139,33 +146,37 @@ class Dian115Client:
         }
 
     def request_json(self, method: str, api_path: str, current_path: str = "/", **kwargs) -> tuple:
-        self._ensure_browser_session(current_path)
-        proof = self._get_proof(current_path)
-        headers = self._headers(current_path)
-        headers["x-portal-browser-proof"] = proof
-        headers.update(self._browser_signature(method, api_path))
-        if "headers" in kwargs:
-            headers.update(kwargs.pop("headers"))
-        url = f"{self.BASE_URL}{api_path}"
-
-        resp = self._session.request(method, url, headers=headers, **kwargs)
-
-        # Handle signature / session invalid auto-recovery
-        if resp.status_code in (400, 401) and any(x in resp.text for x in ["signature", "proof", "browser"]):
-            logger.info("Dian115 签名或会话脱节，自动刷新重新注册 session...")
-            self._browser_session_expires_at = 0
-            self._proof = None
-            self._ensure_browser_session(current_path, refresh=True)
+        try:
+            self._ensure_browser_session(current_path)
             proof = self._get_proof(current_path)
             headers = self._headers(current_path)
             headers["x-portal-browser-proof"] = proof
             headers.update(self._browser_signature(method, api_path))
-            resp = self._session.request(method, url, headers=headers, **kwargs)
+            if "headers" in kwargs:
+                headers.update(kwargs.pop("headers"))
+            url = f"{self.BASE_URL}{api_path}"
 
-        try:
-            return resp.json(), resp.status_code
-        except Exception:
-            return {"error": resp.text}, resp.status_code
+            resp = self._session.request(method, url, headers=headers, timeout=20, **kwargs)
+
+            # Handle signature / session invalid auto-recovery
+            if resp.status_code in (400, 401) and any(x in resp.text for x in ["signature", "proof", "browser"]):
+                logger.info("Dian115 签名或会话脱节，自动刷新重新注册 session...")
+                self._browser_session_expires_at = 0
+                self._proof = None
+                self._ensure_browser_session(current_path, refresh=True)
+                proof = self._get_proof(current_path)
+                headers = self._headers(current_path)
+                headers["x-portal-browser-proof"] = proof
+                headers.update(self._browser_signature(method, api_path))
+                resp = self._session.request(method, url, headers=headers, timeout=20, **kwargs)
+
+            try:
+                return resp.json(), resp.status_code
+            except Exception:
+                return {"error": resp.text[:200]}, resp.status_code
+        except Exception as e:
+            logger.error("网络请求异常 [%s %s]: %s", method, api_path, e)
+            return {"error": str(e), "message": f"网络通信异常: {e}"}, 500
 
     def login(self, email: str = "", password: str = "") -> dict:
         """使用邮箱和密码静默登录并自动换取全新长效 Token"""
@@ -174,27 +185,31 @@ class Dian115Client:
         if not self._email or not self._password:
             return {"success": False, "message": "未配置邮箱或密码"}
 
-        logger.info("正在执行癫影静默登录刷新 Token (账号: %s)...", self._email)
-        data, code = self.request_json(
-            "POST",
-            "/api/portal/auth/login",
-            current_path="/login",
-            headers={"content-type": "application/json"},
-            json={"email": self._email, "password": self._password}
-        )
+        try:
+            logger.info("正在执行癫影静默登录刷新 Token (账号: %s)...", self._email)
+            data, code = self.request_json(
+                "POST",
+                "/api/portal/auth/login",
+                current_path="/login",
+                headers={"content-type": "application/json"},
+                json={"email": self._email, "password": self._password}
+            )
 
-        if code == 200 and data.get("code") == "ok":
-            self._cookie_str = self.get_cookie_string()
-            logger.info("癫影静默登录成功！已自动获取全新 Token")
-            return {
-                "success": True,
-                "user": data.get("user"),
-                "cookie": self._cookie_str
-            }
+            if code == 200 and data.get("code") == "ok":
+                self._cookie_str = self.get_cookie_string()
+                logger.info("癫影静默登录成功！已自动获取全新 Token")
+                return {
+                    "success": True,
+                    "user": data.get("user"),
+                    "cookie": self._cookie_str
+                }
 
-        msg = str(data.get("msg") or data.get("message") or f"登录失败 (HTTP {code})")
-        logger.error("癫影静默登录失败: %s", msg)
-        return {"success": False, "message": msg}
+            msg = str(data.get("msg") or data.get("message") or data.get("error") or f"登录失败 (HTTP {code})")
+            logger.error("癫影静默登录失败: %s", msg)
+            return {"success": False, "message": msg}
+        except Exception as e:
+            logger.error("静默登录发生未捕获异常: %s", e)
+            return {"success": False, "message": f"登录异常: {e}"}
 
     def get_account_info(self) -> dict:
         if not self._cookie_str and (not self._email or not self._password):

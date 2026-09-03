@@ -386,46 +386,63 @@ def api_status():
 
 @app.post("/api/accounts")
 def api_save_account(data: dict):
-    cfg = load_config()
-    accounts = cfg.get("accounts", [])
-    acc_id = data.get("id") or f"acc_{uuid.uuid4().hex[:8]}"
+    try:
+        cfg = load_config()
+        accounts = cfg.get("accounts", [])
+        acc_id = data.get("id") or f"acc_{uuid.uuid4().hex[:8]}"
 
-    existing_idx = next((i for i, a in enumerate(accounts) if a.get("id") == acc_id), None)
-    
-    if existing_idx is not None:
-        target = accounts[existing_idx]
-        target["name"] = data.get("name") or target.get("name")
-        target["email"] = data.get("email") or target.get("email")
-        if data.get("password") and data["password"].strip():
-            target["password"] = data["password"].strip()
-        if "cookie" in data and data["cookie"].strip():
-            target["cookie"] = data["cookie"].strip()
-        target["checkin_mode"] = data.get("checkin_mode", target.get("checkin_mode", "lucky"))
-        target["checkin_time"] = (data.get("checkin_time") or "").strip()
-        target["enabled"] = bool(data.get("enabled", target.get("enabled", True)))
-    else:
-        target = {
-            "id": acc_id,
-            "name": data.get("name") or (data.get("email", "").split("@")[0] if data.get("email") else "新账号"),
-            "email": data.get("email", "").strip(),
-            "password": data.get("password", "").strip(),
-            "cookie": data.get("cookie", "").strip(),
-            "checkin_mode": data.get("checkin_mode", "lucky"),
-            "checkin_time": (data.get("checkin_time") or "").strip(),
-            "enabled": bool(data.get("enabled", True))
-        }
-        accounts.append(target)
+        existing_idx = next((i for i, a in enumerate(accounts) if a.get("id") == acc_id), None)
+        
+        if existing_idx is not None:
+            target = accounts[existing_idx]
+            target["name"] = data.get("name") or target.get("name")
+            target["email"] = data.get("email") or target.get("email")
+            if data.get("password") and data["password"].strip():
+                target["password"] = data["password"].strip()
+            if "cookie" in data and data["cookie"].strip():
+                target["cookie"] = data["cookie"].strip()
+            target["checkin_mode"] = data.get("checkin_mode", target.get("checkin_mode", "lucky"))
+            target["checkin_time"] = (data.get("checkin_time") or "").strip()
+            target["enabled"] = bool(data.get("enabled", target.get("enabled", True)))
+        else:
+            target = {
+                "id": acc_id,
+                "name": data.get("name") or (data.get("email", "").split("@")[0] if data.get("email") else "新账号"),
+                "email": data.get("email", "").strip(),
+                "password": data.get("password", "").strip(),
+                "cookie": data.get("cookie", "").strip(),
+                "checkin_mode": data.get("checkin_mode", "lucky"),
+                "checkin_time": (data.get("checkin_time") or "").strip(),
+                "enabled": bool(data.get("enabled", True))
+            }
+            accounts.append(target)
 
-    # Validate / login immediately if email & password provided
-    cli = get_client_for_account(target)
-    if target.get("email") and target.get("password"):
-        login_res = cli.login()
-        if login_res.get("success") and cli._cookie_str:
-            target["cookie"] = cli._cookie_str
+        # Validate / login immediately if email & password provided
+        login_warning = ""
+        cli = get_client_for_account(target)
+        if target.get("email") and target.get("password"):
+            try:
+                login_res = cli.login()
+                if login_res.get("success") and cli._cookie_str:
+                    target["cookie"] = cli._cookie_str
+                else:
+                    login_warning = login_res.get("message", "登录未成功")
+            except Exception as e:
+                login_warning = f"网络请求异常: {e}"
 
-    cfg["accounts"] = accounts
-    save_config(cfg)
-    return {"ok": True, "account_id": acc_id}
+        cfg["accounts"] = accounts
+        try:
+            save_config(cfg)
+        except Exception as e:
+            logger.error("保存配置失败: %s", e)
+            return JSONResponse(status_code=500, content={"ok": False, "message": f"持久化配置文件写入失败，请检查 Docker 数据目录挂载权限: {e}"})
+
+        if login_warning:
+            return {"ok": True, "account_id": acc_id, "warning": f"账号已添加保存，但在测试登录时提示: {login_warning}"}
+        return {"ok": True, "account_id": acc_id}
+    except Exception as e:
+        logger.exception("保存账号未知错误: %s", e)
+        return JSONResponse(status_code=500, content={"ok": False, "message": f"处理失败: {str(e)}"})
 
 @app.delete("/api/accounts/{account_id}")
 def api_delete_account(account_id: str):
@@ -860,12 +877,21 @@ HTML_PAGE = """<!DOCTYPE html>
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(modalForm)
             });
-            const d = await res.json();
+            let d;
+            try {
+              d = await res.json();
+            } catch(jsonErr) {
+              const text = await res.text();
+              throw new Error(text || `请求失败 (HTTP ${res.status})`);
+            }
             if (d.ok) {
+              if (d.warning) {
+                alert('⚠️ 提示: ' + d.warning);
+              }
               showModal.value = false;
               await loadData();
             } else {
-              alert('保存失败: ' + (d.detail || '未知错误'));
+              alert('保存失败: ' + (d.message || d.detail || '未知错误'));
             }
           } catch(e) {
             alert('请求异常: ' + e.message);
