@@ -57,6 +57,11 @@ services:
     ports:
       # 宿主机访问端口（可根据需要修改左侧 8098 为其他未占用端口）
       - "8098:8080"
+    dns:
+      # 配置可靠 DNS，彻底解决绿联/极空间/部分群晖 Docker 桥接无法解析外网域名的通病
+      - 223.5.5.5
+      - 119.29.29.29
+      - 8.8.8.8
     environment:
       - TZ=Asia/Shanghai
     volumes:
@@ -84,6 +89,10 @@ services:
        restart: always
        ports:
          - "8098:8080"
+       dns:
+         - 223.5.5.5
+         - 119.29.29.29
+         - 8.8.8.8
        environment:
          - TZ=Asia/Shanghai
        volumes:
