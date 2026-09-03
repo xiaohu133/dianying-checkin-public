@@ -1,0 +1,5 @@
+fastapi>=0.100.0
+uvicorn>=0.23.0
+requests>=2.31.0
+curl_cffi>=0.7.0
+cryptography>=41.0.0

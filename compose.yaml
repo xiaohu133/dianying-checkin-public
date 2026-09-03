@@ -1,0 +1,14 @@
+services:
+  dianying-checkin:
+    build: .
+    image: dianying-checkin:latest
+    container_name: dianying-checkin
+    restart: always
+    ports:
+      # Web UI 访问端口（宿主机 8098 映射至容器内部 8080）
+      - "8098:8080"
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      # 数据持久化目录（存放 config.json 与 history.json）
+      - ./data:/app/data
