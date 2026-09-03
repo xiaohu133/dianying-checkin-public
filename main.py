@@ -287,20 +287,41 @@ def execute_all_checkin(is_manual: bool = False) -> list:
 
 # Scheduler loop
 def scheduler_loop():
-    logger.info("Scheduler thread started.")
-    last_run_day = ""
+    logger.info("Scheduler thread started with multi-account schedule support.")
+    account_last_run = {} # acc_id -> "YYYY-MM-DD"
     while True:
         try:
             cfg = load_config()
-            target_time = cfg.get("checkin_time", "00:05").strip()
+            global_time = cfg.get("checkin_time", "00:05").strip()
             now = datetime.now()
             now_time_str = now.strftime("%H:%M")
             today_str = now.strftime("%Y-%m-%d")
 
-            if now_time_str == target_time and last_run_day != today_str:
-                logger.info("Hit scheduled checkin time %s for day %s", target_time, today_str)
-                last_run_day = today_str
-                execute_all_checkin(is_manual=False)
+            for acc in cfg.get("accounts", []):
+                if not acc.get("enabled", True):
+                    continue
+                acc_id = acc.get("id")
+                target_time = (acc.get("checkin_time") or "").strip() or global_time
+                if now_time_str == target_time and account_last_run.get(acc_id) != today_str:
+                    logger.info("Hit scheduled checkin time %s for account %s on %s", target_time, acc.get("name"), today_str)
+                    account_last_run[acc_id] = today_str
+                    res = execute_account_checkin(acc, is_manual=False)
+
+                    # 发送单账号定时签到卡片推送
+                    award = res.get("award")
+                    already = "已签到" in res.get("message", "")
+                    award_str = f"{award:+d} 积分" if isinstance(award, int) and award != 0 else "无变动" if already else "0 积分"
+                    tg_title = "🎬 <b>癫影签到提示 ℹ️</b>" if already else ("🎬 <b>癫影签到成功 🎉</b>" if res.get("success") else "🎬 <b>癫影签到异常 ⚠️</b>")
+                    tg_text = (
+                        f"<b>👤 账号:</b> <code>{res.get('username', res.get('account_name'))}</code>\n"
+                        f"<b>🎯 模式:</b> {res.get('mode')}\n"
+                        f"<b>📊 结果:</b> <code>{res.get('message')}</code>\n"
+                        f"<b>💰 获得奖励:</b> <b>{award_str}</b>\n"
+                        f"<b>💎 当前剩余积分:</b> <b>{res.get('points')} 积分</b>\n"
+                        f"<b>📅 连续签到:</b> <b>{res.get('streak', 0)} 天</b>\n\n"
+                        f"⏰ <i>此账号定时时间: 每天 {target_time}</i>"
+                    )
+                    send_tg_notification(tg_title, tg_text)
         except Exception as e:
             logger.error("Scheduler loop error: %s", e)
         time.sleep(30)
@@ -345,6 +366,7 @@ def api_status():
             "email": acc.get("email", ""),
             "has_password": bool(acc.get("password")),
             "checkin_mode": acc.get("checkin_mode", "lucky"),
+            "checkin_time": (acc.get("checkin_time") or "").strip(),
             "enabled": acc.get("enabled", True),
             "user_info": uinfo,
             "checked_in_today": checked_in_today,
@@ -381,6 +403,7 @@ def api_save_account(data: dict):
         if "cookie" in data and data["cookie"].strip():
             target["cookie"] = data["cookie"].strip()
         target["checkin_mode"] = data.get("checkin_mode", target.get("checkin_mode", "lucky"))
+        target["checkin_time"] = (data.get("checkin_time") or "").strip()
         target["enabled"] = bool(data.get("enabled", target.get("enabled", True)))
     else:
         target = {
@@ -390,6 +413,7 @@ def api_save_account(data: dict):
             "password": data.get("password", "").strip(),
             "cookie": data.get("cookie", "").strip(),
             "checkin_mode": data.get("checkin_mode", "lucky"),
+            "checkin_time": (data.get("checkin_time") or "").strip(),
             "enabled": bool(data.get("enabled", True))
         }
         accounts.append(target)
@@ -541,7 +565,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 ⏳ 今日未签到
               </span>
               <span class="text-[11px] text-zinc-400">
-                {{ acc.checkin_mode === 'lucky' ? '🎲 运气模式' : '📅 普通模式' }}
+                {{ acc.checkin_mode === 'lucky' ? '🎲 运气模式' : '📅 普通模式' }} · ⏰ {{ acc.checkin_time || ('跟随全局 ' + (globalConfig.checkin_time || '00:05')) }}
               </span>
             </div>
           </div>
@@ -712,12 +736,18 @@ HTML_PAGE = """<!DOCTYPE html>
             </div>
           </div>
 
-          <div>
-            <label class="block text-xs font-medium text-zinc-300 mb-1">签到模式</label>
-            <select v-model="modalForm.checkin_mode" class="w-full bg-zinc-900 border border-zinc-700 rounded-xl p-2.5 text-zinc-200 text-xs">
-              <option value="lucky">🎲 运气签到模式（推荐 · 积分收益上限高）</option>
-              <option value="normal">📅 普通稳健模式</option>
-            </select>
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label class="block text-xs font-medium text-zinc-300 mb-1">签到模式</label>
+              <select v-model="modalForm.checkin_mode" class="w-full bg-zinc-900 border border-zinc-700 rounded-xl p-2.5 text-zinc-200 text-xs">
+                <option value="lucky">🎲 运气签到模式 (推荐)</option>
+                <option value="normal">📅 普通稳健模式</option>
+              </select>
+            </div>
+            <div>
+              <label class="block text-xs font-medium text-zinc-300 mb-1">⏰ 独立每日签到时间</label>
+              <input type="text" v-model="modalForm.checkin_time" placeholder="例如 08:30 (留空跟随全局)" class="w-full bg-zinc-900 border border-zinc-700 rounded-xl p-2.5 text-zinc-200 text-xs font-mono">
+            </div>
           </div>
 
           <div>
@@ -772,6 +802,7 @@ HTML_PAGE = """<!DOCTYPE html>
           password: '',
           cookie: '',
           checkin_mode: 'lucky',
+          checkin_time: '',
           enabled: true
         });
 
@@ -801,6 +832,7 @@ HTML_PAGE = """<!DOCTYPE html>
           modalForm.password = '';
           modalForm.cookie = '';
           modalForm.checkin_mode = 'lucky';
+          modalForm.checkin_time = '';
           modalForm.enabled = true;
           showModal.value = true;
         };
@@ -812,6 +844,7 @@ HTML_PAGE = """<!DOCTYPE html>
           modalForm.password = '';
           modalForm.cookie = '';
           modalForm.checkin_mode = acc.checkin_mode || 'lucky';
+          modalForm.checkin_time = acc.checkin_time || '';
           modalForm.enabled = acc.enabled !== false;
           showModal.value = true;
         };
