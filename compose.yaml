@@ -1,7 +1,6 @@
 services:
   dianying-checkin:
-    build: .
-    image: dianying-checkin:latest
+    image: ghcr.io/xiaohu133/dianying-checkin-public:latest
     container_name: dianying-checkin
     restart: always
     ports:
@@ -10,5 +9,5 @@ services:
     environment:
       - TZ=Asia/Shanghai
     volumes:
-      # 数据持久化目录（存放 config.json 与 history.json）
+      # 数据持久化目录（存放账号配置与历史记录）
       - ./data:/app/data
