@@ -13,12 +13,15 @@ logger = logging.getLogger("dian_client")
 class Dian115Client:
     BASE_URL = "https://m.dian115.com"
 
-    def __init__(self, cookie: str = "", email: str = "", password: str = ""):
+    def __init__(self, cookie: str = "", email: str = "", password: str = "", proxy: str = ""):
         self._cookie_str = ""
         self._email = str(email or "").strip()
         self._password = str(password or "").strip()
+        self._proxy = str(proxy or os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY") or "").strip()
         self._visitor_id = str(uuid.uuid4())
         self._session = requests.Session(impersonate="chrome120")
+        if self._proxy:
+            self._session.proxies = {"http": self._proxy, "https": self._proxy}
         self._private_key = ec.generate_private_key(ec.SECP256R1())
         self._browser_session_expires_at = 0.0
         self._server_time_offset_ms = 0
@@ -26,6 +29,13 @@ class Dian115Client:
         self._proof = None # (proof_str, expires_at)
         if cookie:
             self.set_cookie(cookie)
+
+    def set_proxy(self, proxy: str):
+        self._proxy = str(proxy or "").strip()
+        if self._proxy:
+            self._session.proxies = {"http": self._proxy, "https": self._proxy}
+        else:
+            self._session.proxies = {}
 
     @staticmethod
     def _base64url(val: bytes) -> str:

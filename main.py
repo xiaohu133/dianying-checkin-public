@@ -105,16 +105,20 @@ _account_clients: dict[str, Dian115Client] = {}
 
 def get_client_for_account(acc: dict) -> Dian115Client:
     acc_id = acc.get("id") or "acc_default"
+    cfg = load_config()
+    proxy = cfg.get("proxy", "").strip() or os.getenv("HTTP_PROXY", "").strip() or os.getenv("HTTPS_PROXY", "").strip()
     with client_pool_lock:
         if acc_id not in _account_clients:
             _account_clients[acc_id] = Dian115Client(
                 cookie=acc.get("cookie", ""),
                 email=acc.get("email", ""),
-                password=acc.get("password", "")
+                password=acc.get("password", ""),
+                proxy=proxy
             )
         else:
             cli = _account_clients[acc_id]
             cli.set_credentials(acc.get("email", ""), acc.get("password", ""))
+            cli.set_proxy(proxy)
             if acc.get("cookie"):
                 cli.set_cookie(acc.get("cookie", ""))
         return _account_clients[acc_id]
@@ -376,6 +380,7 @@ def api_status():
         "accounts": accounts_status,
         "global_config": {
             "checkin_time": cfg.get("checkin_time", "00:05"),
+            "proxy": cfg.get("proxy", ""),
             "tg_bot_token": cfg.get("tg_bot_token", ""),
             "tg_chat_id": cfg.get("tg_chat_id", ""),
             "tg_base_url": cfg.get("tg_base_url", "https://api.telegram.org"),
@@ -474,7 +479,7 @@ def api_checkin(data: dict = None):
 @app.post("/api/config")
 def api_save_global_config(data: dict):
     cfg = load_config()
-    for k in ["checkin_time", "tg_bot_token", "tg_chat_id", "tg_base_url", "run_on_start"]:
+    for k in ["checkin_time", "proxy", "tg_bot_token", "tg_chat_id", "tg_base_url", "run_on_start"]:
         if k in data:
             cfg[k] = data[k]
     save_config(cfg)
@@ -646,10 +651,14 @@ HTML_PAGE = """<!DOCTYPE html>
         </button>
       </div>
 
-      <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 text-sm">
+      <div class="grid grid-cols-1 sm:grid-cols-4 gap-4 text-sm">
         <div>
           <label class="block text-xs text-zinc-400 mb-1">每日自动签到时间</label>
           <input type="text" v-model="globalConfig.checkin_time" placeholder="00:05" class="w-full bg-zinc-900 border border-zinc-700 rounded-xl p-2.5 text-zinc-200 font-mono text-xs">
+        </div>
+        <div>
+          <label class="block text-xs text-zinc-400 mb-1">网络代理 (可选)</label>
+          <input type="text" v-model="globalConfig.proxy" placeholder="如 http://172.17.0.1:7890" class="w-full bg-zinc-900 border border-zinc-700 rounded-xl p-2.5 text-zinc-200 font-mono text-xs" title="遇Cloudflare拦截或特殊网络时填入">
         </div>
         <div>
           <label class="block text-xs text-zinc-400 mb-1">Telegram Bot Token</label>
@@ -803,6 +812,7 @@ HTML_PAGE = """<!DOCTYPE html>
         const history = ref([]);
         const globalConfig = reactive({
           checkin_time: '00:05',
+          proxy: '',
           tg_bot_token: '',
           tg_chat_id: '',
           tg_base_url: 'https://api.telegram.org',
