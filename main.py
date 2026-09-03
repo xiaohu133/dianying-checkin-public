@@ -232,6 +232,32 @@ def execute_account_checkin(acc: dict, is_manual: bool = False) -> dict:
     append_history(record)
     return record
 
+def send_account_tg_notification(r: dict, is_manual: bool = False, target_time: str = ""):
+    cfg = load_config()
+    award = r.get("award")
+    already = "已签到" in r.get("message", "")
+    award_str = f"{award:+d} 积分" if isinstance(award, int) and award != 0 else "无变动" if already else "0 积分"
+    prefix = "⚡ [手动] " if is_manual else ""
+    if already:
+        tg_title = f"🎬 <b>{prefix}癫影签到提示 ℹ️</b>"
+    elif r.get("success"):
+        tg_title = f"🎬 <b>{prefix}癫影签到成功 🎉</b>"
+    else:
+        tg_title = f"🎬 <b>{prefix}癫影签到异常 ⚠️</b>"
+
+    time_info = f"每天 {target_time}" if target_time else f"每天 {cfg.get('checkin_time', '00:05')}"
+
+    tg_text = (
+        f"<b>👤 账号:</b> <code>{r.get('username', r.get('account_name'))}</code>\n"
+        f"<b>🎯 模式:</b> {r.get('mode')}\n"
+        f"<b>📊 结果:</b> <code>{r.get('message')}</code>\n"
+        f"<b>💰 获得奖励:</b> <b>{award_str}</b>\n"
+        f"<b>💎 当前剩余积分:</b> <b>{r.get('points')} 积分</b>\n"
+        f"<b>📅 连续签到:</b> <b>{r.get('streak', 0)} 天</b>\n\n"
+        f"⏰ <i>定时配置: {time_info}</i>"
+    )
+    send_tg_notification(tg_title, tg_text)
+
 def execute_all_checkin(is_manual: bool = False) -> list:
     cfg = load_config()
     accounts = [a for a in cfg.get("accounts", []) if a.get("enabled", True)]
@@ -252,23 +278,10 @@ def execute_all_checkin(is_manual: bool = False) -> list:
 
     # 组装合并 Telegram 卡片通知
     if len(results) == 1:
-        r = results[0]
-        award = r.get("award")
-        already = "已签到" in r.get("message", "")
-        award_str = f"{award:+d} 积分" if isinstance(award, int) and award != 0 else "无变动" if already else "0 积分"
-        tg_title = "🎬 <b>癫影签到提示 ℹ️</b>" if already else ("🎬 <b>癫影签到成功 🎉</b>" if r.get("success") else "🎬 <b>癫影签到异常 ⚠️</b>")
-        tg_text = (
-            f"<b>👤 账号:</b> <code>{r.get('username', r.get('account_name'))}</code>\n"
-            f"<b>🎯 模式:</b> {r.get('mode')}\n"
-            f"<b>📊 结果:</b> <code>{r.get('message')}</code>\n"
-            f"<b>💰 获得奖励:</b> <b>{award_str}</b>\n"
-            f"<b>💎 当前剩余积分:</b> <b>{r.get('points')} 积分</b>\n"
-            f"<b>📅 连续签到:</b> <b>{r.get('streak', 0)} 天</b>\n\n"
-            f"⏰ <i>下次执行时间: 每天 {cfg.get('checkin_time', '00:05')}</i>"
-        )
-        send_tg_notification(tg_title, tg_text)
+        send_account_tg_notification(results[0], is_manual=is_manual, target_time=(accounts[0].get("checkin_time") or "").strip())
     elif len(results) > 1:
-        tg_title = f"🎬 <b>癫影多账号自动签到汇总报告 ({len(results)}个账号) 🎉</b>"
+        prefix = "⚡ [手动] " if is_manual else ""
+        tg_title = f"🎬 <b>{prefix}癫影多账号自动签到汇总报告 ({len(results)}个账号) 🎉</b>"
         items_text = []
         for idx, r in enumerate(results, 1):
             award = r.get("award")
@@ -306,22 +319,7 @@ def scheduler_loop():
                     logger.info("Hit scheduled checkin time %s for account %s on %s", target_time, acc.get("name"), today_str)
                     account_last_run[acc_id] = today_str
                     res = execute_account_checkin(acc, is_manual=False)
-
-                    # 发送单账号定时签到卡片推送
-                    award = res.get("award")
-                    already = "已签到" in res.get("message", "")
-                    award_str = f"{award:+d} 积分" if isinstance(award, int) and award != 0 else "无变动" if already else "0 积分"
-                    tg_title = "🎬 <b>癫影签到提示 ℹ️</b>" if already else ("🎬 <b>癫影签到成功 🎉</b>" if res.get("success") else "🎬 <b>癫影签到异常 ⚠️</b>")
-                    tg_text = (
-                        f"<b>👤 账号:</b> <code>{res.get('username', res.get('account_name'))}</code>\n"
-                        f"<b>🎯 模式:</b> {res.get('mode')}\n"
-                        f"<b>📊 结果:</b> <code>{res.get('message')}</code>\n"
-                        f"<b>💰 获得奖励:</b> <b>{award_str}</b>\n"
-                        f"<b>💎 当前剩余积分:</b> <b>{res.get('points')} 积分</b>\n"
-                        f"<b>📅 连续签到:</b> <b>{res.get('streak', 0)} 天</b>\n\n"
-                        f"⏰ <i>此账号定时时间: 每天 {target_time}</i>"
-                    )
-                    send_tg_notification(tg_title, tg_text)
+                    send_account_tg_notification(res, is_manual=False, target_time=target_time)
         except Exception as e:
             logger.error("Scheduler loop error: %s", e)
         time.sleep(30)
@@ -450,6 +448,7 @@ def api_checkin(data: dict = None):
         if not acc:
             raise HTTPException(status_code=404, detail="Account not found")
         res = execute_account_checkin(acc, is_manual=True)
+        send_account_tg_notification(res, is_manual=True, target_time=(acc.get("checkin_time") or "").strip())
         return {"ok": True, "results": [res]}
     else:
         results = execute_all_checkin(is_manual=True)
