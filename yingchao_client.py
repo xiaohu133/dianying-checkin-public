@@ -63,8 +63,8 @@ class YingChaoClient:
         if not clean:
             return
 
-        # Check if entire string is just the raw token (e.g. starts with eyJ...)
-        if clean.startswith("eyJ") and ";" not in clean and "=" not in clean:
+        # Check if entire string is just the raw token or api_key (no ; or =)
+        if ";" not in clean and "=" not in clean:
             self._token = clean
         else:
             # Parse key=value pairs
@@ -73,7 +73,7 @@ class YingChaoClient:
                 if "=" in p:
                     k, v = p.split("=", 1)
                     k, v = k.strip(), v.strip()
-                    if k in ("token", "hdh_token", "session_token"):
+                    if k in ("token", "hdh_token", "session_token", "api_key", "apiKey", "apikey"):
                         self._token = v
                     elif k == "hdh_uid" and v.isdigit():
                         self._user_id = v
@@ -193,9 +193,10 @@ class YingChaoClient:
                 }
                 headers.update(sign_res["headers"])
 
-                # Attach user cookies and authorization token
+                # Attach user cookies and authorization token / API Key
                 if self._token:
                     headers["Authorization"] = f"Bearer {self._token}"
+                    headers["X-API-Key"] = self._token
                     headers["Cookie"] = f"token={self._token}; hdh_uid={self._user_id}"
                 elif self._cookie_str:
                     headers["Cookie"] = self._cookie_str

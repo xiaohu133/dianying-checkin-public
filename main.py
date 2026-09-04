@@ -873,11 +873,11 @@ HTML_PAGE = """<!DOCTYPE html>
             <div class="p-3 bg-amber-950/30 border border-amber-500/20 rounded-xl space-y-2">
               <div class="font-semibold text-xs text-amber-300 flex items-center gap-1.5">
                 <i class="fa-solid fa-key text-amber-400"></i>
-                <span>影巢 Token / Cookie 认证</span>
+                <span>影巢 API Key / Token / Cookie 认证</span>
               </div>
               <div>
-                <label class="block text-[11px] text-zinc-300 mb-1">用户凭证 (Token 或整段 Cookie)</label>
-                <textarea v-model="modalForm.cookie" rows="3" placeholder="粘贴在 https://re0.me/ 登录后的 token 字符串 (如 eyJ...) 或整段 Cookie" class="w-full bg-zinc-900 border border-zinc-700 rounded-xl p-2 text-zinc-200 font-mono text-xs"></textarea>
+                <label class="block text-[11px] text-zinc-300 mb-1">用户凭证 (支持 API Key / Token / 完整 Cookie)</label>
+                <textarea v-model="modalForm.cookie" rows="3" placeholder="粘贴你的影巢 API Key，或登录 https://re0.me/ 后的 token 字符串 (如 eyJ...) / Cookie" class="w-full bg-zinc-900 border border-zinc-700 rounded-xl p-2 text-zinc-200 font-mono text-xs"></textarea>
               </div>
               <div class="text-[11px] text-zinc-400 space-y-1">
                 <p>💡 <b>如何获取</b>：</p>
