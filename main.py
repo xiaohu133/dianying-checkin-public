@@ -14,6 +14,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
 from dian_client import Dian115Client
+from yingchao_client import YingChaoClient
 
 # Setup logging
 logging.basicConfig(
@@ -23,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("dianying-checkin")
 
-DATA_DIR = Path("/app/data")
+DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data" if Path("/app").exists() else "./data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_FILE = DATA_DIR / "config.json"
 HISTORY_FILE = DATA_DIR / "history.json"
@@ -99,28 +100,43 @@ def append_history(record: dict):
     except Exception as e:
         logger.error("Failed to append history: %s", e)
 
-# Isolated Dian115 Client pool
+# Isolated Client pool for Dian115 and YingChao
 client_pool_lock = threading.Lock()
-_account_clients: dict[str, Dian115Client] = {}
+_account_clients: dict[str, object] = {}
 
-def get_client_for_account(acc: dict) -> Dian115Client:
+def get_client_for_account(acc: dict):
     acc_id = acc.get("id") or "acc_default"
+    platform = acc.get("platform", "dianying")
     cfg = load_config()
     proxy = cfg.get("proxy", "").strip() or os.getenv("HTTP_PROXY", "").strip() or os.getenv("HTTPS_PROXY", "").strip()
+    auth_str = str(acc.get("cookie", "") or acc.get("token", "")).strip()
+
     with client_pool_lock:
-        if acc_id not in _account_clients:
-            _account_clients[acc_id] = Dian115Client(
-                cookie=acc.get("cookie", ""),
-                email=acc.get("email", ""),
-                password=acc.get("password", ""),
-                proxy=proxy
-            )
+        if platform == "yingchao":
+            if acc_id not in _account_clients or not isinstance(_account_clients[acc_id], YingChaoClient):
+                _account_clients[acc_id] = YingChaoClient(
+                    cookie=auth_str,
+                    proxy=proxy
+                )
+            else:
+                cli = _account_clients[acc_id]
+                cli.set_proxy(proxy)
+                if auth_str:
+                    cli.set_cookie(auth_str)
         else:
-            cli = _account_clients[acc_id]
-            cli.set_credentials(acc.get("email", ""), acc.get("password", ""))
-            cli.set_proxy(proxy)
-            if acc.get("cookie"):
-                cli.set_cookie(acc.get("cookie", ""))
+            if acc_id not in _account_clients or not isinstance(_account_clients[acc_id], Dian115Client):
+                _account_clients[acc_id] = Dian115Client(
+                    cookie=auth_str,
+                    email=acc.get("email", ""),
+                    password=acc.get("password", ""),
+                    proxy=proxy
+                )
+            else:
+                cli = _account_clients[acc_id]
+                cli.set_credentials(acc.get("email", ""), acc.get("password", ""))
+                cli.set_proxy(proxy)
+                if auth_str:
+                    cli.set_cookie(auth_str)
         return _account_clients[acc_id]
 
 def send_tg_notification(title: str, text_content: str):
@@ -165,11 +181,21 @@ def send_tg_notification(title: str, text_content: str):
 
 def execute_account_checkin(acc: dict, is_manual: bool = False) -> dict:
     acc_id = acc.get("id")
-    acc_name = acc.get("name") or acc.get("email") or f"账号({acc_id})"
-    mode = acc.get("checkin_mode", "lucky")
-    mode_name = "🎲 运气签到" if mode == "lucky" else "📅 普通签到"
+    platform = acc.get("platform", "dianying")
+    is_yc = (platform == "yingchao")
+    p_name = "影巢" if is_yc else "癫影"
+    p_icon = "🪺" if is_yc else "🎬"
 
-    logger.info("=== 正在执行账号签到: %s (%s, 手动=%s) ===", acc_name, mode_name, is_manual)
+    acc_name = acc.get("name") or acc.get("email") or f"账号({acc_id})"
+    raw_mode = acc.get("checkin_mode")
+    if is_yc:
+        mode = raw_mode or "normal"
+        mode_name = "🎲 赌狗签到" if mode == "gambler" else "📅 每日签到"
+    else:
+        mode = raw_mode or "lucky"
+        mode_name = "🎲 运气签到" if mode == "lucky" else "📅 普通签到"
+
+    logger.info("=== 正在执行 [%s] 账号签到: %s (%s, 手动=%s) ===", p_name, acc_name, mode_name, is_manual)
 
     cli = get_client_for_account(acc)
 
@@ -177,11 +203,12 @@ def execute_account_checkin(acc: dict, is_manual: bool = False) -> dict:
     user_info = cli.get_account_info()
     if not user_info.get("authenticated"):
         msg = user_info.get("message") or "认证失效或未登录"
-        logger.error("账号 %s 验证失败: %s", acc_name, msg)
+        logger.error("[%s] 账号 %s 验证失败: %s", p_name, acc_name, msg)
         record = {
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "account_id": acc_id,
             "account_name": acc_name,
+            "platform": platform,
             "success": False,
             "mode": mode_name,
             "message": msg,
@@ -194,19 +221,20 @@ def execute_account_checkin(acc: dict, is_manual: bool = False) -> dict:
 
     username = user_info.get("username") or acc_name
 
-    # 2. 同步 Cookie 变动到配置
-    if cli._cookie_str and cli._cookie_str != acc.get("cookie"):
+    # 2. 同步 Cookie 变动到配置 (若有新续期的 Cookie)
+    cookie_field = getattr(cli, "_cookie_str", None)
+    if cookie_field and cookie_field != acc.get("cookie"):
         cfg = load_config()
         for a in cfg.get("accounts", []):
             if a.get("id") == acc_id:
-                a["cookie"] = cli._cookie_str
+                a["cookie"] = cookie_field
                 break
         save_config(cfg)
 
     # 3. 发起签到
     try:
         res = cli.signin(mode=mode)
-        logger.info("账号 %s 签到结果: %s", acc_name, res)
+        logger.info("[%s] 账号 %s 签到结果: %s", p_name, acc_name, res)
     except Exception as e:
         err_msg = f"签到请求异常: {e}"
         logger.error(err_msg)
@@ -214,6 +242,7 @@ def execute_account_checkin(acc: dict, is_manual: bool = False) -> dict:
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "account_id": acc_id,
             "account_name": acc_name,
+            "platform": platform,
             "success": False,
             "mode": mode_name,
             "message": err_msg,
@@ -238,6 +267,7 @@ def execute_account_checkin(acc: dict, is_manual: bool = False) -> dict:
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "account_id": acc_id,
         "account_name": acc_name,
+        "platform": platform,
         "success": success,
         "mode": mode_name,
         "message": msg,
@@ -252,19 +282,25 @@ def execute_account_checkin(acc: dict, is_manual: bool = False) -> dict:
 def send_account_tg_notification(r: dict, is_manual: bool = False, target_time: str = ""):
     cfg = load_config()
     award = r.get("award")
-    already = "已签到" in r.get("message", "")
+    platform = r.get("platform", "dianying")
+    is_yc = (platform == "yingchao")
+    p_name = "影巢" if is_yc else "癫影"
+    p_icon = "🪺" if is_yc else "🎬"
+
+    already = "已签到" in r.get("message", "") or "今日已签" in r.get("message", "")
     award_str = f"{award:+d} 积分" if isinstance(award, int) and award != 0 else "无变动" if already else "0 积分"
     prefix = "⚡ [手动] " if is_manual else ""
     if already:
-        tg_title = f"🎬 <b>{prefix}癫影签到提示 ℹ️</b>"
+        tg_title = f"{p_icon} <b>{prefix}{p_name}签到提示 ℹ️</b>"
     elif r.get("success"):
-        tg_title = f"🎬 <b>{prefix}癫影签到成功 🎉</b>"
+        tg_title = f"{p_icon} <b>{prefix}{p_name}签到成功 🎉</b>"
     else:
-        tg_title = f"🎬 <b>{prefix}癫影签到异常 ⚠️</b>"
+        tg_title = f"{p_icon} <b>{prefix}{p_name}签到异常 ⚠️</b>"
 
     time_info = f"每天 {target_time}" if target_time else f"每天 {cfg.get('checkin_time', '00:05')}"
 
     tg_text = (
+        f"<b>🏷️ 平台:</b> {p_icon} <b>{p_name}</b>\n"
         f"<b>👤 账号:</b> <code>{r.get('username', r.get('account_name'))}</code>\n"
         f"<b>🎯 模式:</b> {r.get('mode')}\n"
         f"<b>📊 结果:</b> <code>{r.get('message')}</code>\n"
@@ -282,7 +318,7 @@ def execute_all_checkin(is_manual: bool = False) -> list:
         logger.warning("未配置任何已启用的签到账号")
         return []
 
-    logger.info("=== 开始批量执行癫影签到 (共 %d 个账号, 手动=%s) ===", len(accounts), is_manual)
+    logger.info("=== 开始批量执行多平台账号签到 (共 %d 个账号, 手动=%s) ===", len(accounts), is_manual)
     results = []
 
     for acc in accounts:
@@ -298,15 +334,17 @@ def execute_all_checkin(is_manual: bool = False) -> list:
         send_account_tg_notification(results[0], is_manual=is_manual, target_time=(accounts[0].get("checkin_time") or "").strip())
     elif len(results) > 1:
         prefix = "⚡ [手动] " if is_manual else ""
-        tg_title = f"🎬 <b>{prefix}癫影多账号自动签到汇总报告 ({len(results)}个账号) 🎉</b>"
+        tg_title = f"✨ <b>{prefix}多平台账号自动签到汇总报告 ({len(results)}个账号) 🎉</b>"
         items_text = []
         for idx, r in enumerate(results, 1):
             award = r.get("award")
-            already = "已签到" in r.get("message", "")
+            already = "已签到" in r.get("message", "") or "今日已签" in r.get("message", "")
             award_str = f"{award:+d}" if isinstance(award, int) and award != 0 else ("0" if not already else "-")
             status_icon = "✅" if r.get("success") else "❌"
+            p_icon = "🪺" if r.get("platform") == "yingchao" else "🎬"
+            p_name = "影巢" if r.get("platform") == "yingchao" else "癫影"
             items_text.append(
-                f"<b>{idx}. {r.get('account_name', '账号')}</b> ({r.get('username')})\n"
+                f"<b>{idx}. {p_icon} [{p_name}] {r.get('account_name', '账号')}</b> ({r.get('username')})\n"
                 f"   {status_icon} <code>{r.get('message')}</code> (奖励: <b>{award_str}</b>)\n"
                 f"   💰 剩余积分: <b>{r.get('points')}</b> | 连续: <b>{r.get('streak', 0)}天</b>"
             )
@@ -360,9 +398,10 @@ def api_status():
     accounts_status = []
     for acc in cfg.get("accounts", []):
         acc_id = acc.get("id")
+        platform = acc.get("platform", "dianying")
         cli = get_client_for_account(acc)
         uinfo = None
-        if acc.get("cookie") or (acc.get("email") and acc.get("password")):
+        if acc.get("cookie") or acc.get("token") or (acc.get("email") and acc.get("password")):
             try:
                 uinfo = cli.get_account_info()
             except Exception as e:
@@ -375,12 +414,15 @@ def api_status():
             for h in history
         )
 
+        default_mode = "normal" if platform == "yingchao" else "lucky"
         safe_acc = {
             "id": acc_id,
+            "platform": platform,
             "name": acc.get("name") or acc.get("email", ""),
             "email": acc.get("email", ""),
             "has_password": bool(acc.get("password")),
-            "checkin_mode": acc.get("checkin_mode", "lucky"),
+            "has_cookie": bool(acc.get("cookie") or acc.get("token")),
+            "checkin_mode": acc.get("checkin_mode", default_mode),
             "checkin_time": (acc.get("checkin_time") or "").strip(),
             "enabled": acc.get("enabled", True),
             "user_info": uinfo,
@@ -408,45 +450,64 @@ def api_save_account(data: dict):
         cfg = load_config()
         accounts = cfg.get("accounts", [])
         acc_id = data.get("id") or f"acc_{uuid.uuid4().hex[:8]}"
+        platform = data.get("platform", "dianying")
 
         existing_idx = next((i for i, a in enumerate(accounts) if a.get("id") == acc_id), None)
         
+        default_mode = "normal" if platform == "yingchao" else "lucky"
+        cookie_val = (data.get("cookie") or data.get("token") or "").strip()
+
         if existing_idx is not None:
             target = accounts[existing_idx]
+            target["platform"] = platform
             target["name"] = data.get("name") or target.get("name")
             target["email"] = data.get("email") or target.get("email")
             if data.get("password") and data["password"].strip():
                 target["password"] = data["password"].strip()
-            if "cookie" in data and data["cookie"].strip():
-                target["cookie"] = data["cookie"].strip()
-            target["checkin_mode"] = data.get("checkin_mode", target.get("checkin_mode", "lucky"))
+            if cookie_val:
+                target["cookie"] = cookie_val
+            target["checkin_mode"] = data.get("checkin_mode", target.get("checkin_mode", default_mode))
             target["checkin_time"] = (data.get("checkin_time") or "").strip()
             target["enabled"] = bool(data.get("enabled", target.get("enabled", True)))
         else:
             target = {
                 "id": acc_id,
-                "name": data.get("name") or (data.get("email", "").split("@")[0] if data.get("email") else "新账号"),
+                "platform": platform,
+                "name": data.get("name") or (data.get("email", "").split("@")[0] if data.get("email") else ("影巢账号" if platform == "yingchao" else "新账号")),
                 "email": data.get("email", "").strip(),
                 "password": data.get("password", "").strip(),
-                "cookie": data.get("cookie", "").strip(),
-                "checkin_mode": data.get("checkin_mode", "lucky"),
+                "cookie": cookie_val,
+                "checkin_mode": data.get("checkin_mode", default_mode),
                 "checkin_time": (data.get("checkin_time") or "").strip(),
                 "enabled": bool(data.get("enabled", True))
             }
             accounts.append(target)
 
-        # Validate / login immediately if email & password provided
+        # Immediate validation for account
         login_warning = ""
         cli = get_client_for_account(target)
-        if target.get("email") and target.get("password"):
-            try:
-                login_res = cli.login()
-                if login_res.get("success") and cli._cookie_str:
-                    target["cookie"] = cli._cookie_str
-                else:
-                    login_warning = login_res.get("message", "登录未成功")
-            except Exception as e:
-                login_warning = f"网络请求异常: {e}"
+
+        if platform == "yingchao":
+            if not target.get("cookie"):
+                login_warning = "未填写影巢 Token 或 Cookie"
+            else:
+                try:
+                    uinfo = cli.get_account_info()
+                    if not uinfo.get("authenticated"):
+                        login_warning = uinfo.get("message") or "影巢 Token 验证失败，请确认是否有效"
+                except Exception as e:
+                    login_warning = f"连接影巢测试异常: {e}"
+        else:
+            # Dian115 email & password validation
+            if target.get("email") and target.get("password"):
+                try:
+                    login_res = cli.login()
+                    if login_res.get("success") and cli._cookie_str:
+                        target["cookie"] = cli._cookie_str
+                    else:
+                        login_warning = login_res.get("message", "登录未成功")
+                except Exception as e:
+                    login_warning = f"网络请求异常: {e}"
 
         cfg["accounts"] = accounts
         try:
@@ -456,7 +517,7 @@ def api_save_account(data: dict):
             return JSONResponse(status_code=500, content={"ok": False, "message": f"持久化配置文件写入失败，请检查 Docker 数据目录挂载权限: {e}"})
 
         if login_warning:
-            return {"ok": True, "account_id": acc_id, "warning": f"账号已添加保存，但在测试登录时提示: {login_warning}"}
+            return {"ok": True, "account_id": acc_id, "warning": f"账号已保存，但在测试连接时提示: {login_warning}"}
         return {"ok": True, "account_id": acc_id}
     except Exception as e:
         logger.exception("保存账号未知错误: %s", e)
@@ -513,7 +574,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>🎬 癫影多账号自动签到中心</title>
+  <title>🎬 癫影 & 🪺 影巢 多账号自动签到中心</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
   <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
@@ -529,17 +590,17 @@ HTML_PAGE = """<!DOCTYPE html>
     <!-- Header -->
     <header class="glass p-6 flex flex-col md:flex-row items-center justify-between gap-4 shadow-2xl">
       <div class="flex items-center gap-4">
-        <div class="w-14 h-14 rounded-2xl bg-indigo-500/20 border border-indigo-500/30 flex items-center justify-center text-3xl text-indigo-400 shadow-inner">
-          🎬
+        <div class="w-14 h-14 rounded-2xl bg-indigo-500/20 border border-indigo-500/30 flex items-center justify-center text-3xl shadow-inner">
+          ✨
         </div>
         <div>
           <div class="flex items-center gap-3">
-            <h1 class="text-2xl font-bold bg-gradient-to-r from-indigo-400 via-purple-400 to-pink-400 bg-clip-text text-transparent">癫影多账号自动签到</h1>
+            <h1 class="text-2xl font-bold bg-gradient-to-r from-indigo-400 via-purple-400 to-amber-400 bg-clip-text text-transparent">癫影 & 影巢 多账号自动签到</h1>
             <span class="px-2.5 py-0.5 text-xs font-bold rounded-full bg-indigo-500/20 text-indigo-400 border border-indigo-500/30">
               {{ accounts.length }} 个账号
             </span>
           </div>
-          <p class="text-xs text-zinc-400 mt-1">支持多账号聚合 · 独立 ECDSA 签名与静默续期 · Telegram 合并汇报卡片</p>
+          <p class="text-xs text-zinc-400 mt-1">支持 🎬 癫影 (m.dian115.com) 与 🪺 影巢 (re0.me) · WASM 密钥握手与独立签名 · Telegram 聚合汇报</p>
         </div>
       </div>
       <div class="flex items-center gap-3 flex-wrap">
@@ -568,7 +629,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
       <div v-if="!accounts.length" class="glass p-12 text-center space-y-4">
         <div class="text-4xl">📭</div>
-        <div class="text-zinc-400">暂未添加任何癫影账号</div>
+        <div class="text-zinc-400">暂未添加任何签到账号</div>
         <button @click="openAddModal" class="px-5 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-sm font-medium">
           立即添加第一个账号
         </button>
@@ -579,16 +640,21 @@ HTML_PAGE = """<!DOCTYPE html>
           <!-- Top Row -->
           <div class="flex items-start justify-between gap-3">
             <div class="flex items-center gap-3">
-              <div class="w-12 h-12 rounded-full bg-indigo-950/80 border border-indigo-500/30 flex items-center justify-center font-bold text-lg text-indigo-400 overflow-hidden shrink-0">
+              <div class="w-12 h-12 rounded-full flex items-center justify-center font-bold text-lg overflow-hidden shrink-0 border" :class="acc.platform === 'yingchao' ? 'bg-amber-950/80 border-amber-500/30 text-amber-400' : 'bg-indigo-950/80 border-indigo-500/30 text-indigo-400'">
                 <img v-if="acc.user_info && acc.user_info.avatar" :src="acc.user_info.avatar" class="w-full h-full object-cover">
-                <span v-else>{{ (acc.name || acc.email || 'U')[0].toUpperCase() }}</span>
+                <span v-else>{{ acc.platform === 'yingchao' ? '🪺' : (acc.name || acc.email || 'U')[0].toUpperCase() }}</span>
               </div>
               <div>
-                <div class="font-bold text-zinc-100 flex items-center gap-2">
+                <div class="font-bold text-zinc-100 flex items-center gap-2 flex-wrap">
                   <span>{{ acc.name }}</span>
+                  <span v-if="acc.platform === 'yingchao'" class="px-2 py-0.5 text-[10px] font-bold rounded-md bg-amber-500/20 text-amber-300 border border-amber-500/30">🪺 影巢</span>
+                  <span v-else class="px-2 py-0.5 text-[10px] font-bold rounded-md bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">🎬 癫影</span>
                   <span v-if="acc.user_info && acc.user_info.is_vip" class="px-2 py-0.5 text-[10px] font-bold rounded-full bg-amber-500/20 text-amber-400 border border-amber-500/30">VIP</span>
                 </div>
-                <div class="text-xs text-zinc-400 font-mono">{{ acc.email || '未填邮箱' }}</div>
+                <div class="text-xs text-zinc-400 font-mono mt-0.5">
+                  <span v-if="acc.platform === 'yingchao'">{{ (acc.user_info && acc.user_info.username) ? ('@' + acc.user_info.username) : '影巢用户' }}</span>
+                  <span v-else>{{ acc.email || '未填邮箱' }}</span>
+                </div>
               </div>
             </div>
 
@@ -601,7 +667,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 ⏳ 今日未签到
               </span>
               <span class="text-[11px] text-zinc-400">
-                {{ acc.checkin_mode === 'lucky' ? '🎲 运气模式' : '📅 普通模式' }} · ⏰ {{ acc.checkin_time || ('跟随全局 ' + (globalConfig.checkin_time || '00:05')) }}
+                {{ acc.platform === 'yingchao' ? (acc.checkin_mode === 'gambler' ? '🎲 赌狗模式' : '📅 每日签到') : (acc.checkin_mode === 'lucky' ? '🎲 运气模式' : '📅 普通模式') }} · ⏰ {{ acc.checkin_time || ('跟随全局 ' + (globalConfig.checkin_time || '00:05')) }}
               </span>
             </div>
           </div>
@@ -621,9 +687,10 @@ HTML_PAGE = """<!DOCTYPE html>
               </div>
             </div>
             <div>
-              <div class="text-[11px] text-zinc-500">自动续期</div>
+              <div class="text-[11px] text-zinc-500">认证/模式</div>
               <div class="text-sm font-semibold mt-1">
-                <span v-if="acc.has_password" class="text-emerald-400" title="已开启账号密码静默续期"><i class="fa-solid fa-shield-halved"></i> 守护中</span>
+                <span v-if="acc.platform === 'yingchao'" class="text-amber-400 text-xs" title="通过本地 Node.js WASM 会话签名"><i class="fa-solid fa-key"></i> WASM签名</span>
+                <span v-else-if="acc.has_password" class="text-emerald-400 text-xs" title="已开启账号密码静默续期"><i class="fa-solid fa-shield-halved"></i> 密码守护</span>
                 <span v-else class="text-zinc-500 text-xs">仅Cookie</span>
               </div>
             </div>
@@ -632,7 +699,7 @@ HTML_PAGE = """<!DOCTYPE html>
           <!-- Bottom Actions -->
           <div class="flex items-center justify-between pt-1 text-xs">
             <div class="text-zinc-500">
-              <span v-if="acc.user_info && acc.user_info.vip_until">VIP至: {{ acc.user_info.vip_until.split('T')[0] }}</span>
+              <span v-if="acc.user_info && acc.user_info.vip_until">VIP至: {{ (acc.user_info.vip_until || '').split('T')[0] }}</span>
               <span v-else-if="acc.user_info && !acc.user_info.authenticated" class="text-rose-400">
                 {{ acc.user_info.message || '认证失效' }}
               </span>
@@ -673,7 +740,7 @@ HTML_PAGE = """<!DOCTYPE html>
         </div>
         <div>
           <label class="block text-xs text-zinc-400 mb-1">网络代理 (可选)</label>
-          <input type="text" v-model="globalConfig.proxy" placeholder="如 http://172.17.0.1:7890" class="w-full bg-zinc-900 border border-zinc-700 rounded-xl p-2.5 text-zinc-200 font-mono text-xs" title="遇Cloudflare拦截或特殊网络时填入">
+          <input type="text" v-model="globalConfig.proxy" placeholder="如 http://172.17.0.1:7890" class="w-full bg-zinc-900 border border-zinc-700 rounded-xl p-2.5 text-zinc-200 font-mono text-xs" title="遇特殊网络或代理需求时填入">
         </div>
         <div>
           <label class="block text-xs text-zinc-400 mb-1">Telegram Bot Token</label>
@@ -705,6 +772,7 @@ HTML_PAGE = """<!DOCTYPE html>
           <thead class="text-xs uppercase bg-zinc-900/60 text-zinc-400">
             <tr>
               <th class="px-4 py-3 rounded-l-xl">执行时间</th>
+              <th class="px-4 py-3">平台</th>
               <th class="px-4 py-3">账号</th>
               <th class="px-4 py-3">模式</th>
               <th class="px-4 py-3">状态/响应</th>
@@ -715,9 +783,13 @@ HTML_PAGE = """<!DOCTYPE html>
           <tbody class="divide-y divide-zinc-800">
             <tr v-for="h in history" :key="h.time + h.account_name" class="hover:bg-zinc-800/30 transition-colors">
               <td class="px-4 py-3 font-mono text-xs text-zinc-400">{{ h.time }}</td>
+              <td class="px-4 py-3">
+                <span v-if="h.platform === 'yingchao'" class="px-2 py-0.5 text-[11px] rounded-md bg-amber-500/20 text-amber-300 border border-amber-500/30 font-semibold">🪺 影巢</span>
+                <span v-else class="px-2 py-0.5 text-[11px] rounded-md bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-semibold">🎬 癫影</span>
+              </td>
               <td class="px-4 py-3 font-medium text-zinc-200">{{ h.account_name || h.username }}</td>
               <td class="px-4 py-3">
-                <span class="px-2 py-0.5 text-xs rounded-full" :class="h.mode && h.mode.includes('运气') ? 'bg-pink-500/20 text-pink-300' : 'bg-blue-500/20 text-blue-300'">
+                <span class="px-2 py-0.5 text-xs rounded-full" :class="(h.mode && (h.mode.includes('运气') || h.mode.includes('赌狗'))) ? 'bg-pink-500/20 text-pink-300' : 'bg-blue-500/20 text-blue-300'">
                   {{ h.mode || '自动' }}
                 </span>
               </td>
@@ -732,7 +804,7 @@ HTML_PAGE = """<!DOCTYPE html>
               <td class="px-4 py-3 text-emerald-400 font-semibold">{{ h.points ?? '-' }}</td>
             </tr>
             <tr v-if="!history.length">
-              <td colspan="6" class="text-center py-8 text-zinc-500 text-sm">暂无签到历史记录</td>
+              <td colspan="7" class="text-center py-8 text-zinc-500 text-sm">暂无签到历史记录</td>
             </tr>
           </tbody>
         </table>
@@ -745,7 +817,7 @@ HTML_PAGE = """<!DOCTYPE html>
         <div class="flex items-center justify-between pb-2 border-b border-zinc-800">
           <h3 class="text-lg font-bold text-zinc-100 flex items-center gap-2">
             <i class="fa-solid fa-user-plus text-indigo-400"></i>
-            <span>{{ modalForm.id ? '编辑癫影账号' : '添加癫影账号' }}</span>
+            <span>{{ modalForm.id ? '编辑账号' : '添加签到账号' }}</span>
           </h3>
           <button @click="showModal = false" class="text-zinc-400 hover:text-zinc-200">
             <i class="fa-solid fa-xmark text-lg"></i>
@@ -753,33 +825,78 @@ HTML_PAGE = """<!DOCTYPE html>
         </div>
 
         <div class="space-y-3.5 text-sm">
+          <!-- Platform Selector -->
+          <div>
+            <label class="block text-xs font-medium text-zinc-300 mb-1.5">选择目标平台</label>
+            <div class="grid grid-cols-2 gap-2 p-1 bg-zinc-900 border border-zinc-700 rounded-xl">
+              <button type="button" @click="onPlatformChange('dianying')" :class="modalForm.platform === 'dianying' ? 'bg-indigo-600 text-white shadow' : 'text-zinc-400 hover:text-zinc-200'" class="py-2 text-xs font-semibold rounded-lg transition-all flex items-center justify-center gap-2">
+                <span>🎬 癫影 (m.dian115.com)</span>
+              </button>
+              <button type="button" @click="onPlatformChange('yingchao')" :class="modalForm.platform === 'yingchao' ? 'bg-amber-600 text-white shadow' : 'text-zinc-400 hover:text-zinc-200'" class="py-2 text-xs font-semibold rounded-lg transition-all flex items-center justify-center gap-2">
+                <span>🪺 影巢 (re0.me)</span>
+              </button>
+            </div>
+          </div>
+
           <div>
             <label class="block text-xs font-medium text-zinc-300 mb-1">账号备注名 (必填)</label>
-            <input type="text" v-model="modalForm.name" placeholder="例如：主账号 / 小号" class="w-full bg-zinc-900 border border-zinc-700 rounded-xl p-2.5 text-zinc-200 text-xs">
+            <input type="text" v-model="modalForm.name" :placeholder="modalForm.platform === 'yingchao' ? '例如：影巢主号' : '例如：癫影大号'" class="w-full bg-zinc-900 border border-zinc-700 rounded-xl p-2.5 text-zinc-200 text-xs">
           </div>
 
-          <!-- Silent Login Form -->
-          <div class="p-3 bg-indigo-950/30 border border-indigo-500/20 rounded-xl space-y-2.5">
-            <div class="font-semibold text-xs text-indigo-300 flex items-center gap-1.5">
-              <i class="fa-solid fa-shield-halved text-emerald-400"></i>
-              <span>账号密码静默续期（推荐 · 永不过期）</span>
-            </div>
-            <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-              <div>
-                <label class="block text-[11px] text-zinc-400 mb-1">注册邮箱 (Email)</label>
-                <input type="email" v-model="modalForm.email" placeholder="youremail@qq.com" class="w-full bg-zinc-900 border border-zinc-700 rounded-xl p-2 text-zinc-200 text-xs">
+          <!-- Platform 1: DianYing Forms -->
+          <template v-if="modalForm.platform === 'dianying'">
+            <div class="p-3 bg-indigo-950/30 border border-indigo-500/20 rounded-xl space-y-2.5">
+              <div class="font-semibold text-xs text-indigo-300 flex items-center gap-1.5">
+                <i class="fa-solid fa-shield-halved text-emerald-400"></i>
+                <span>癫影账号密码静默续期（推荐 · 自动刷新）</span>
               </div>
-              <div>
-                <label class="block text-[11px] text-zinc-400 mb-1">登录密码 (Password)</label>
-                <input type="password" v-model="modalForm.password" :placeholder="modalForm.id ? '留空则保持原密码' : '输入密码'" class="w-full bg-zinc-900 border border-zinc-700 rounded-xl p-2 text-zinc-200 text-xs">
+              <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                <div>
+                  <label class="block text-[11px] text-zinc-400 mb-1">注册邮箱 (Email)</label>
+                  <input type="email" v-model="modalForm.email" placeholder="youremail@qq.com" class="w-full bg-zinc-900 border border-zinc-700 rounded-xl p-2 text-zinc-200 text-xs">
+                </div>
+                <div>
+                  <label class="block text-[11px] text-zinc-400 mb-1">登录密码 (Password)</label>
+                  <input type="password" v-model="modalForm.password" :placeholder="modalForm.id ? '留空则保持原密码' : '输入密码'" class="w-full bg-zinc-900 border border-zinc-700 rounded-xl p-2 text-zinc-200 text-xs">
+                </div>
               </div>
             </div>
-          </div>
 
+            <div>
+              <label class="block text-xs font-medium text-zinc-300 mb-1">手动指定 Cookie (可选备用)</label>
+              <textarea v-model="modalForm.cookie" rows="2" placeholder="填了账号密码后系统会自动获取并维护 Cookie，此处可留空..." class="w-full bg-zinc-900 border border-zinc-700 rounded-xl p-2 text-zinc-200 font-mono text-xs"></textarea>
+            </div>
+          </template>
+
+          <!-- Platform 2: YingChao Forms -->
+          <template v-else>
+            <div class="p-3 bg-amber-950/30 border border-amber-500/20 rounded-xl space-y-2">
+              <div class="font-semibold text-xs text-amber-300 flex items-center gap-1.5">
+                <i class="fa-solid fa-key text-amber-400"></i>
+                <span>影巢 Token / Cookie 认证</span>
+              </div>
+              <div>
+                <label class="block text-[11px] text-zinc-300 mb-1">用户凭证 (Token 或整段 Cookie)</label>
+                <textarea v-model="modalForm.cookie" rows="3" placeholder="粘贴在 https://re0.me/ 登录后的 token 字符串 (如 eyJ...) 或整段 Cookie" class="w-full bg-zinc-900 border border-zinc-700 rounded-xl p-2 text-zinc-200 font-mono text-xs"></textarea>
+              </div>
+              <div class="text-[11px] text-zinc-400 space-y-1">
+                <p>💡 <b>如何获取</b>：</p>
+                <p>1. 在电脑或手机浏览器访问 <a href="https://re0.me/" target="_blank" class="text-amber-400 underline">https://re0.me/</a> 登录你的影巢账号。</p>
+                <p>2. 按 <code>F12</code> 打开开发者工具 -> Application（应用）-> Cookies -> <code>https://re0.me</code>，复制 <code>token</code> 字段的值粘贴至上方即可。</p>
+                <p>3. 系统将使用内置 WASM 引擎自动完成安全握手 (Handshake) 与 PoW 算力验签。</p>
+              </div>
+            </div>
+          </template>
+
+          <!-- Mode and Time (Common) -->
           <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
               <label class="block text-xs font-medium text-zinc-300 mb-1">签到模式</label>
-              <select v-model="modalForm.checkin_mode" class="w-full bg-zinc-900 border border-zinc-700 rounded-xl p-2.5 text-zinc-200 text-xs">
+              <select v-if="modalForm.platform === 'yingchao'" v-model="modalForm.checkin_mode" class="w-full bg-zinc-900 border border-zinc-700 rounded-xl p-2.5 text-zinc-200 text-xs">
+                <option value="normal">📅 每日普通签到 (稳定获得积分)</option>
+                <option value="gambler">🎲 赌狗签到模式 (随机翻倍/扣除)</option>
+              </select>
+              <select v-else v-model="modalForm.checkin_mode" class="w-full bg-zinc-900 border border-zinc-700 rounded-xl p-2.5 text-zinc-200 text-xs">
                 <option value="lucky">🎲 运气签到模式 (推荐)</option>
                 <option value="normal">📅 普通稳健模式</option>
               </select>
@@ -788,11 +905,6 @@ HTML_PAGE = """<!DOCTYPE html>
               <label class="block text-xs font-medium text-zinc-300 mb-1">⏰ 独立每日签到时间</label>
               <input type="text" v-model="modalForm.checkin_time" placeholder="例如 08:30 (留空跟随全局)" class="w-full bg-zinc-900 border border-zinc-700 rounded-xl p-2.5 text-zinc-200 text-xs font-mono">
             </div>
-          </div>
-
-          <div>
-            <label class="block text-xs font-medium text-zinc-300 mb-1">手动指定 Cookie (可选备用)</label>
-            <textarea v-model="modalForm.cookie" rows="2" placeholder="填了账号密码后系统会自动获取并维护 Cookie，此处可留空..." class="w-full bg-zinc-900 border border-zinc-700 rounded-xl p-2 text-zinc-200 font-mono text-xs"></textarea>
           </div>
 
           <div class="flex items-center gap-2 pt-1">
@@ -838,6 +950,7 @@ HTML_PAGE = """<!DOCTYPE html>
         const showModal = ref(false);
         const modalForm = reactive({
           id: '',
+          platform: 'dianying',
           name: '',
           email: '',
           password: '',
@@ -846,6 +959,15 @@ HTML_PAGE = """<!DOCTYPE html>
           checkin_time: '',
           enabled: true
         });
+
+        const onPlatformChange = (p) => {
+          modalForm.platform = p;
+          if (p === 'yingchao' && modalForm.checkin_mode === 'lucky') {
+            modalForm.checkin_mode = 'normal';
+          } else if (p === 'dianying' && modalForm.checkin_mode === 'gambler') {
+            modalForm.checkin_mode = 'lucky';
+          }
+        };
 
         const loadData = async () => {
           refreshing.value = true;
@@ -868,6 +990,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
         const openAddModal = () => {
           modalForm.id = '';
+          modalForm.platform = 'dianying';
           modalForm.name = '';
           modalForm.email = '';
           modalForm.password = '';
@@ -880,11 +1003,12 @@ HTML_PAGE = """<!DOCTYPE html>
 
         const openEditModal = (acc) => {
           modalForm.id = acc.id;
+          modalForm.platform = acc.platform || 'dianying';
           modalForm.name = acc.name || '';
           modalForm.email = acc.email || '';
           modalForm.password = '';
           modalForm.cookie = '';
-          modalForm.checkin_mode = acc.checkin_mode || 'lucky';
+          modalForm.checkin_mode = acc.checkin_mode || (modalForm.platform === 'yingchao' ? 'normal' : 'lucky');
           modalForm.checkin_time = acc.checkin_time || '';
           modalForm.enabled = acc.enabled !== false;
           showModal.value = true;
@@ -893,6 +1017,10 @@ HTML_PAGE = """<!DOCTYPE html>
         const saveAccount = async () => {
           if (!modalForm.name) {
             alert('请填写账号备注名');
+            return;
+          }
+          if (modalForm.platform === 'yingchao' && !modalForm.id && !modalForm.cookie) {
+            alert('请填写影巢 Token 或 Cookie');
             return;
           }
           savingAccount.value = true;
@@ -1012,7 +1140,7 @@ HTML_PAGE = """<!DOCTYPE html>
         return {
           refreshing, checkingAll, savingGlobal, testingTg, savingAccount, actionLoading,
           accounts, history, globalConfig, showModal, modalForm,
-          loadData, openAddModal, openEditModal, saveAccount, deleteAccount, checkinSingle, checkinAll,
+          onPlatformChange, loadData, openAddModal, openEditModal, saveAccount, deleteAccount, checkinSingle, checkinAll,
           saveGlobalConfig, testTelegram
         };
       }

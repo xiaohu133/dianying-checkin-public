@@ -4,15 +4,10 @@ services:
     container_name: dianying-checkin
     restart: always
     ports:
-      # Web UI 访问端口（宿主机 8098 映射至容器内部 8080，可随意修改）
+      # Web UI 访问端口（宿主机 8098 映射至容器内部 8080）
       - "8098:8080"
-    dns:
-      # 配置公共 DNS，彻底解决绿联/极空间等 NAS 容器内部无法解析域名的通病
-      - 223.5.5.5
-      - 119.29.29.29
-      - 8.8.8.8
     environment:
       - TZ=Asia/Shanghai
     volumes:
-      # 数据持久化目录（存放账号与签到历史）
+      # 数据持久化目录（存放账号配置与历史记录）
       - ./data:/app/data
